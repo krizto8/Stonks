@@ -1,0 +1,42 @@
+version: '3.8'
+
+services:
+  trading-system:
+    build: .
+    ports:
+      - "8501:8501"
+    environment:
+      - ENABLE_LIVE_PREDICTION=true
+      - MODEL_NAME=lstm_pattern_classifier
+      - TICKER=AAPL
+      - INTERVAL=1m
+      - ENVIRONMENT=production
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./logs:/app/logs
+      - ./.env:/app/.env
+    restart: unless-stopped
+    
+  # Optional: Redis for caching (uncomment if needed)
+  # redis:
+  #   image: redis:alpine
+  #   ports:
+  #     - "6379:6379"
+  #   restart: unless-stopped
+    
+  # Optional: PostgreSQL for data storage (uncomment if needed)
+  # postgres:
+  #   image: postgres:13
+  #   environment:
+  #     POSTGRES_DB: trading_db
+  #     POSTGRES_USER: trading_user
+  #     POSTGRES_PASSWORD: trading_password
+  #   volumes:
+  #     - postgres_data:/var/lib/postgresql/data
+  #   ports:
+  #     - "5432:5432"
+  #   restart: unless-stopped
+
+# volumes:
+#   postgres_data:
