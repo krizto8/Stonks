@@ -1,6 +1,6 @@
 # 🎯 Stock Trading System with LSTM Pattern Recognition
 
-An advanced, fully-automated machine learning system that uses LSTM neural networks to detect chart patterns and generate real-time trading signals. Features a dynamic dashboard with automatic live prediction startup and robust NaN-free data processing.
+An advanced, fully-automated machine learning system that uses LSTM neural networks to detect chart patterns and generate real-time trading signals. Features a dynamic dashboard with automatic live prediction startup.
 
 ## ✨ Key Features
 
@@ -275,26 +275,6 @@ Pattern Classification (Uptrend/Downtrend/Head-Shoulders/Double Bottom)
 | **SMA 5/20** | Simple moving averages | Trend identification |
 | **RSI** | Relative Strength Index | Overbought/oversold |
 | **Volatility** | 20-period rolling std | Risk assessment |
-
-### 🛡️ NaN-Resistant Data Pipeline
-
-**Problem**: Zero volume during pre/post-market caused NaN values → Model returned NaN predictions → Confidence showed "nan%"
-
-**Solution**: Multi-layer NaN protection
-```python
-# 1. Smart Volume Ratio Calculation
-volume_ma = df['volume'].rolling(window=20).mean()
-volume_ma = volume_ma.fillna(df['volume'].expanding().mean())  # Fallback to expanding mean
-volume_ma = volume_ma.fillna(df['volume'])  # Final fallback to actual volume  
-volume_ma = volume_ma.replace(0, 1.0)  # Prevent division by zero
-df['volume_ratio'] = df['volume'] / volume_ma
-
-# 2. Feature Preparation with Multiple Fallbacks
-feature_df = feature_df.ffill().bfill()  # Forward/backward fill
-feature_df[col] = pd.to_numeric(feature_df[col], errors='coerce')  # Convert to numeric
-feature_df = feature_df.fillna(0.0)  # Final safety net
-```
-
 
 
 ### 🔧 Common Issues & Solutions
