@@ -1,34 +1,34 @@
 #!/usr/bin/env python3
 """
-Live Stock Trading Dashboard
+Stock Trading Dashboard with Auto-Start Functionality
 
-Interactive Streamlit dashboard for monitoring live predictions and trading signals.
+A comprehensive Streamlit dashboard for monitoring real-time trading signals,
+pattern predictions, and system status.
 
-Usage:
-    streamlit run dashboard_app.py
+Features:
+- Real-time signal monitoring for multiple tickers
+- Auto-start functionality for live predictions
+- Interactive charts and visualizations
+- Pattern probability distributions
+- System health monitoring
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import plotly.express as px
 import json
 import os
 import sys
 import subprocess
-import threading
-import time
+import plotly.graph_objects as go
+import plotly.express as px
 from datetime import datetime, timedelta
+from pathlib import Path
 import time
 
-# Add parent directory to path for imports
+# Add parent directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 from config.config import Config
-from utils.data_utils import DataFetcher, DataPreprocessor
-from utils.model_utils import LSTMModel
 
 # Page configuration
 st.set_page_config(
@@ -38,473 +38,536 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-class Dashboard:
-    """Main dashboard class."""
+# Custom CSS
+st.markdown("""
+<style>
+    .main-header {
+        font-size: 3rem;
+        font-weight: bold;
+        color: #1f77b4;
+        text-align: center;
+        margin-bottom: 2rem;
+    }
+    .metric-card {
+        background-color: #f0f2f6;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        border-left: 5px solid #1f77b4;
+    }
+    .buy-signal {
+        color: #00ff00;
+        font-weight: bold;
+        font-size: 1.5rem;
+    }
+    .sell-signal {
+        color: #ff0000;
+        font-weight: bold;
+        font-size: 1.5rem;
+    }
+    .hold-signal {
+        color: #ffa500;
+        font-weight: bold;
+        font-size: 1.5rem;
+    }
+    .status-active {
+        color: #00ff00;
+    }
+    .status-inactive {
+        color: #ff0000;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+
+class DashboardApp:
+    """Main dashboard application class."""
     
     def __init__(self):
-        self.data_fetcher = None
-        self.data_preprocessor = DataPreprocessor()
+        self.data_dir = Path(Config.DATA_DIR)
+        self.models_dir = Path(Config.MODELS_DIR)
+        self.logs_dir = Path(Config.LOGS_DIR)
+        self.available_tickers = self._get_available_tickers()
         
-    def start_live_prediction(self, ticker):
-        """Start live prediction for a ticker in the background."""
-        try:
-            # Check if already running
-            if self.is_live_prediction_running(ticker):
-                return True
-                
-            # Command to start live prediction
-            cmd = [
-                sys.executable, 
-                "scripts/live_prediction.py",
-                "--model_name", "lstm_pattern_classifier", 
-                "--ticker", ticker
-            ]
-            
-            # Start in background
-            subprocess.Popen(
-                cmd, 
-                cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
-            
-            # Give it a moment to start
-            time.sleep(2)
-            return True
-            
-        except Exception as e:
-            st.error(f"Failed to start live prediction for {ticker}: {str(e)}")
-            return False
+    def _get_available_tickers(self):
+        """Get list of tickers with live signal files."""
+        signal_files = list(self.data_dir.glob("live_signals_*.json"))
+        tickers = [f.stem.replace("live_signals_", "") for f in signal_files]
+        return sorted(tickers)
     
-    def is_live_prediction_running(self, ticker):
-        """Check if live prediction is already running for a ticker."""
-        status_file = os.path.join(Config.DATA_DIR, f"live_status_{ticker}.json")
-        if not os.path.exists(status_file):
-            return False
-            
-        try:
-            with open(status_file, 'r') as f:
-                status = json.load(f)
-            
-            # Check if the last update was recent (within last 5 minutes)
-            last_update = status.get('last_update')
-            if last_update:
-                last_update_time = pd.to_datetime(last_update)
-                time_diff = (pd.Timestamp.now() - last_update_time).total_seconds()
-                return time_diff < 300  # 5 minutes
-                
-        except Exception:
-            return False
-            
-        return False
-        
-    def load_live_signals(self, ticker):
-        """Load live signals from file."""
-        try:
-            signals_file = os.path.join(Config.DATA_DIR, f"live_signals_{ticker}.json")
-            if os.path.exists(signals_file):
-                with open(signals_file, 'r') as f:
+    def _load_live_signals(self, ticker):
+        """Load live signals from JSON file."""
+        signal_file = self.data_dir / f"live_signals_{ticker}.json"
+        if signal_file.exists():
+            try:
+                with open(signal_file, 'r') as f:
                     signals = json.load(f)
-                return pd.DataFrame(signals)
-            return pd.DataFrame()
-        except Exception as e:
-            st.error(f"Error loading signals: {str(e)}")
-            return pd.DataFrame()
+                return signals if signals else []
+            except Exception as e:
+                st.warning(f"Error loading signals for {ticker}: {e}")
+                return []
+        return []
     
-    def load_live_status(self, ticker):
-        """Load live status from file."""
-        try:
-            status_file = os.path.join(Config.DATA_DIR, f"live_status_{ticker}.json")
-            if os.path.exists(status_file):
+    def _load_live_status(self, ticker):
+        """Load live prediction status from JSON file."""
+        status_file = self.data_dir / f"live_status_{ticker}.json"
+        if status_file.exists():
+            try:
                 with open(status_file, 'r') as f:
-                    status = json.load(f)
-                return status
-            return {}
-        except Exception as e:
-            st.error(f"Error loading status: {str(e)}")
-            return {}
+                    return json.load(f)
+            except Exception as e:
+                st.warning(f"Error loading status for {ticker}: {e}")
+                return None
+        return None
     
-    def load_historical_data(self, ticker, interval, period):
-        """Load historical data for charts."""
-        try:
-            self.data_fetcher = DataFetcher(ticker=ticker, interval=interval)
-            raw_data = self.data_fetcher.fetch_historical_data(period=period)
-            processed_data = self.data_preprocessor.calculate_technical_indicators(raw_data)
-            return processed_data
-        except Exception as e:
-            st.error(f"Error loading historical data: {str(e)}")
-            return pd.DataFrame()
-    
-    def create_candlestick_chart(self, data, signals_df):
-        """Create candlestick chart with signals overlay."""
-        fig = make_subplots(
-            rows=3, cols=1,
-            shared_xaxes=True,
-            vertical_spacing=0.03,
-            subplot_titles=('Price & Signals', 'Volume', 'Technical Indicators'),
-            row_heights=[0.6, 0.2, 0.2]
-        )
+    def _check_prediction_running(self, ticker):
+        """Check if live prediction is running for a ticker."""
+        # Check both status file AND signals file for recent activity
+        is_active = False
         
-        # Candlestick chart
-        fig.add_trace(
-            go.Candlestick(
-                x=data.index,
-                open=data['open'],
-                high=data['high'],
-                low=data['low'],
-                close=data['close'],
-                name="Price"
-            ),
-            row=1, col=1
-        )
+        # First check status file
+        status = self._load_live_status(ticker)
+        if status:
+            last_update = datetime.fromisoformat(status.get('last_update', ''))
+            time_diff = datetime.now() - last_update
+            # Consider active if status updated within last 30 minutes
+            if time_diff.total_seconds() < 1800:
+                is_active = True
         
-        # Add moving averages
-        if 'sma_20' in data.columns:
-            fig.add_trace(
-                go.Scatter(
-                    x=data.index,
-                    y=data['sma_20'],
-                    mode='lines',
-                    name='SMA 20',
-                    line=dict(color='orange', width=1)
-                ),
-                row=1, col=1
-            )
-        
-        if 'sma_50' in data.columns:
-            fig.add_trace(
-                go.Scatter(
-                    x=data.index,
-                    y=data['sma_50'],
-                    mode='lines',
-                    name='SMA 50',
-                    line=dict(color='blue', width=1)
-                ),
-                row=1, col=1
-            )
-        
-        # Add Bollinger Bands
-        if all(col in data.columns for col in ['bb_upper', 'bb_lower']):
-            fig.add_trace(
-                go.Scatter(
-                    x=data.index,
-                    y=data['bb_upper'],
-                    mode='lines',
-                    name='BB Upper',
-                    line=dict(color='gray', width=1, dash='dash'),
-                    showlegend=False
-                ),
-                row=1, col=1
-            )
-            
-            fig.add_trace(
-                go.Scatter(
-                    x=data.index,
-                    y=data['bb_lower'],
-                    mode='lines',
-                    name='BB Lower',
-                    line=dict(color='gray', width=1, dash='dash'),
-                    fill='tonexty',
-                    fillcolor='rgba(128,128,128,0.1)',
-                    showlegend=False
-                ),
-                row=1, col=1
-            )
-        
-        # Add trading signals
-        if not signals_df.empty:
-            for _, signal in signals_df.iterrows():
+        # Also check signals file for recent signals (more reliable)
+        if not is_active:
+            signals = self._load_live_signals(ticker)
+            if signals and len(signals) > 0:
                 try:
-                    timestamp = pd.to_datetime(signal['timestamp'])
-                    signal_type = signal['signal']
-                    price = signal['current_price']
-                    
-                    color = 'green' if signal_type == 'BUY' else 'red' if signal_type == 'SELL' else 'yellow'
-                    symbol = 'triangle-up' if signal_type == 'BUY' else 'triangle-down' if signal_type == 'SELL' else 'circle'
-                    
-                    fig.add_trace(
-                        go.Scatter(
-                            x=[timestamp],
-                            y=[price],
-                            mode='markers',
-                            marker=dict(
-                                symbol=symbol,
-                                size=12,
-                                color=color,
-                                line=dict(color='black', width=1)
-                            ),
-                            name=f'{signal_type} Signal',
-                            showlegend=False,
-                            hovertemplate=f"<b>{signal_type}</b><br>" +
-                                        f"Price: ${price:.2f}<br>" +
-                                        f"Confidence: {signal['confidence']:.1%}<br>" +
-                                        f"Time: {timestamp}<extra></extra>"
-                        ),
-                        row=1, col=1
-                    )
-                except Exception as e:
-                    continue
-        
-        # Volume chart
-        fig.add_trace(
-            go.Bar(
-                x=data.index,
-                y=data['volume'],
-                name='Volume',
-                marker_color='lightblue'
-            ),
-            row=2, col=1
-        )
-        
-        # Technical indicators
-        if 'rsi' in data.columns:
-            fig.add_trace(
-                go.Scatter(
-                    x=data.index,
-                    y=data['rsi'],
-                    mode='lines',
-                    name='RSI',
-                    line=dict(color='purple')
-                ),
-                row=3, col=1
-            )
-            
-            # RSI overbought/oversold lines
-            fig.add_hline(y=70, line_dash="dash", line_color="red", row=3, col=1)
-            fig.add_hline(y=30, line_dash="dash", line_color="green", row=3, col=1)
-        
-        # Update layout
-        fig.update_layout(
-            title="Stock Price Analysis with Trading Signals",
-            xaxis_rangeslider_visible=False,
-            height=800,
-            showlegend=True
-        )
-        
-        fig.update_yaxes(title_text="Price ($)", row=1, col=1)
-        fig.update_yaxes(title_text="Volume", row=2, col=1)
-        fig.update_yaxes(title_text="RSI", row=3, col=1, range=[0, 100])
-        
-        return fig
-    
-    def create_signals_table(self, signals_df):
-        """Create signals summary table."""
-        if signals_df.empty:
-            return pd.DataFrame()
-        
-        # Sort by timestamp descending
-        signals_df = signals_df.sort_values('timestamp', ascending=False)
-        
-        # Format for display
-        display_df = signals_df[['timestamp', 'signal', 'confidence', 'current_price']].copy()
-        display_df['timestamp'] = pd.to_datetime(display_df['timestamp']).dt.strftime('%Y-%m-%d %H:%M:%S')
-        
-        # Convert confidence to float and format as percentage
-        display_df['confidence'] = pd.to_numeric(display_df['confidence'], errors='coerce')
-        display_df['confidence'] = display_df['confidence'].apply(lambda x: f"{x:.1%}" if pd.notna(x) else "N/A")
-        
-        display_df['current_price'] = display_df['current_price'].apply(lambda x: f"${x:.2f}")
-        
-        display_df.columns = ['Timestamp', 'Signal', 'Confidence', 'Price']
-        
-        return display_df
-    
-    def run(self):
-        """Run the dashboard."""
-        st.title("📈 Live Stock Trading Dashboard")
-        
-        # Sidebar controls
-        st.sidebar.header("Configuration")
-        
-        # Stock selection
-        ticker = st.sidebar.text_input("Stock Ticker", value="AAPL").upper()
-        
-        # Time settings
-        interval = st.sidebar.selectbox(
-            "Data Interval",
-            ["1m", "5m", "15m", "30m", "1h", "1d"],
-            index=2
-        )
-        
-        period = st.sidebar.selectbox(
-            "Historical Period",
-            ["1d", "5d", "1mo", "3mo", "6mo", "1y"],
-            index=2
-        )
-        
-        # Auto-refresh
-        auto_refresh = st.sidebar.checkbox("Auto Refresh", value=True)
-        refresh_interval = st.sidebar.slider("Refresh Interval (seconds)", 30, 300, 60)
-        
-        # Manual refresh button
-        if st.sidebar.button("Refresh Now"):
-            st.rerun()
-        
-        # Load data
-        with st.spinner("Loading data..."):
-            # Load historical data
-            historical_data = self.load_historical_data(ticker, interval, period)
-            
-            # Load live signals
-            signals_df = self.load_live_signals(ticker)
-            
-            # Load live status
-            status = self.load_live_status(ticker)
-            
-            # Check if live prediction is running for this ticker
-            if not status:
-                col1, col2 = st.columns([2, 1])
-                
-                with col1:
-                    st.warning(f"⚠️ No live prediction running for {ticker}")
-                    
-                with col2:
-                    if st.button(f"🚀 Start Live Prediction for {ticker}", type="primary"):
-                        with st.spinner(f"Starting live prediction for {ticker}..."):
-                            if self.start_live_prediction(ticker):
-                                st.success(f"✅ Live prediction started for {ticker}!")
-                                st.info("Waiting for first prediction... (may take 1-2 minutes)")
-                                time.sleep(3)
-                                st.rerun()
-                            else:
-                                st.error(f"❌ Failed to start live prediction for {ticker}")
-                
-                # Show available tickers
-                available_tickers = []
-                try:
-                    for file in os.listdir(Config.DATA_DIR):
-                        if file.startswith("live_status_") and file.endswith(".json"):
-                            ticker_name = file.replace("live_status_", "").replace(".json", "")
-                            if self.is_live_prediction_running(ticker_name):
-                                available_tickers.append(ticker_name)
+                    # Check the most recent signal timestamp
+                    latest_signal = signals[-1]
+                    signal_timestamp = datetime.fromisoformat(latest_signal.get('timestamp', ''))
+                    time_diff = datetime.now() - signal_timestamp
+                    # Consider active if signal generated within last 10 minutes
+                    if time_diff.total_seconds() < 600:
+                        is_active = True
                 except:
                     pass
-                
-                if available_tickers:
-                    st.info(f"💡 Currently running predictions: {', '.join(available_tickers)}")
-                else:
-                    st.info("💡 No live predictions currently running")
         
-        # Main content
-        if not historical_data.empty:
-            # Current price and status
-            current_price = historical_data['close'].iloc[-1]
-            price_change = historical_data['close'].iloc[-1] - historical_data['close'].iloc[-2]
-            price_change_pct = (price_change / historical_data['close'].iloc[-2]) * 100
+        return is_active
+    
+    def _start_live_prediction(self, ticker, model_name):
+        """Start live prediction for a ticker in the background."""
+        try:
+            script_path = Path(__file__).parent.parent / "scripts" / "live_prediction.py"
+            cmd = [sys.executable, str(script_path), 
+                   "--model_name", model_name, 
+                   "--ticker", ticker]
             
-            # Status indicators
-            col1, col2, col3, col4 = st.columns(4)
+            # Start in background (platform-specific)
+            if sys.platform == 'win32':
+                subprocess.Popen(cmd, creationflags=subprocess.CREATE_NEW_CONSOLE)
+            else:
+                subprocess.Popen(cmd, start_new_session=True)
             
-            with col1:
-                st.metric(
-                    label=f"{ticker} Price",
-                    value=f"${current_price:.2f}",
-                    delta=f"{price_change_pct:+.2f}%"
+            return True
+        except Exception as e:
+            st.error(f"Failed to start live prediction: {e}")
+            return False
+    
+    def render_header(self):
+        """Render dashboard header."""
+        st.markdown('<h1 class="main-header">📈 Stock Trading Dashboard</h1>', 
+                   unsafe_allow_html=True)
+        st.markdown("---")
+    
+    def render_sidebar(self):
+        """Render sidebar with controls."""
+        st.sidebar.header("⚙️ Dashboard Controls")
+        
+        # Model selection
+        available_models = self._get_available_models()
+        selected_model = st.sidebar.selectbox(
+            "Select Model",
+            available_models,
+            index=0 if available_models else 0
+        )
+        
+        # Show all available tickers automatically (no selection needed)
+        if self.available_tickers:
+            selected_tickers = self.available_tickers
+        else:
+            selected_tickers = []
+
+        # Enter ticker for prediction
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("➕ Add New Ticker")
+        new_ticker = st.sidebar.text_input("Enter Ticker Symbol", "").upper()
+        
+        if st.sidebar.button("🚀 Start Live Prediction"):
+            if new_ticker:
+                with st.spinner(f"Starting live prediction for {new_ticker}..."):
+                    if self._start_live_prediction(new_ticker, selected_model):
+                        st.sidebar.success(f"Started prediction for {new_ticker}")
+                        time.sleep(2)
+                        st.rerun()
+                    else:
+                        st.sidebar.error(f"Failed to start prediction for {new_ticker}")
+            else:
+                st.sidebar.warning("Please enter a ticker symbol")
+        
+        # Refresh controls
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("🔄 Refresh Settings")
+        auto_refresh = st.sidebar.checkbox("Auto Refresh", value=True)
+        refresh_interval = st.sidebar.slider("Refresh Interval (seconds)", 5, 60, 10)
+        
+        if st.sidebar.button("🔄 Refresh Now"):
+            st.rerun()
+        
+        # System info
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("ℹ️ System Info")
+        st.sidebar.info(f"Active Tickers: {len(self.available_tickers)}")
+        st.sidebar.info(f"Models Available: {len(available_models)}")
+        
+        return selected_tickers, auto_refresh, refresh_interval
+    
+    def _get_available_models(self):
+        """Get list of available model files."""
+        model_files = list(self.models_dir.glob("*.h5"))
+        models = [f.stem for f in model_files]
+        return sorted(models) if models else ["lstm_pattern_classifier"]
+    
+    def render_ticker_status(self, ticker):
+        """Render status card for a ticker."""
+        signals = self._load_live_signals(ticker)
+        is_running = self._check_prediction_running(ticker)
+        
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            status_text = "🟢 Active" if is_running else "🔴 Inactive"
+            st.metric("Status", status_text)
+        
+        # Calculate metrics from signals file (more reliable)
+        with col2:
+            prediction_count = len(signals) if signals else 0
+            st.metric("Total Signals", prediction_count)
+        
+        with col3:
+            # Count errors could be tracked differently, for now show 0
+            # Could enhance to track API failures or other issues
+            st.metric("Errors", 0)
+        
+        with col4:
+            if signals and len(signals) > 0:
+                try:
+                    latest_signal = signals[-1]
+                    signal_timestamp = datetime.fromisoformat(latest_signal.get('timestamp', ''))
+                    time_ago = datetime.now() - signal_timestamp
+                    minutes_ago = int(time_ago.total_seconds() / 60)
+                    
+                    if minutes_ago < 60:
+                        st.metric("Last Signal", f"{minutes_ago}m ago")
+                    elif minutes_ago < 1440:  # Less than 24 hours
+                        hours_ago = int(minutes_ago / 60)
+                        st.metric("Last Signal", f"{hours_ago}h ago")
+                    else:
+                        days_ago = int(minutes_ago / 1440)
+                        st.metric("Last Signal", f"{days_ago}d ago")
+                except:
+                    st.metric("Last Signal", "N/A")
+            else:
+                st.metric("Last Signal", "N/A")
+    
+    def render_latest_signal(self, ticker):
+        """Render the latest signal for a ticker."""
+        signals = self._load_live_signals(ticker)
+        
+        if not signals:
+            st.warning(f"No signals available for {ticker}")
+            return
+        
+        # Get latest signal
+        latest = signals[-1]
+        
+        # Signal card
+        col1, col2, col3 = st.columns([2, 2, 3])
+        
+        with col1:
+            signal_type = latest.get('signal', 'HOLD')
+            confidence = latest.get('confidence', 0) * 100
+            
+            if signal_type == 'BUY':
+                st.markdown(f'<p class="buy-signal">🟢 {signal_type}</p>', unsafe_allow_html=True)
+            elif signal_type == 'SELL':
+                st.markdown(f'<p class="sell-signal">🔴 {signal_type}</p>', unsafe_allow_html=True)
+            else:
+                st.markdown(f'<p class="hold-signal">🟡 {signal_type}</p>', unsafe_allow_html=True)
+            
+            st.metric("Confidence", f"{confidence:.2f}%")
+        
+        with col2:
+            st.metric("Current Price", f"${latest.get('current_price', 0):.2f}")
+            pattern = latest.get('pattern_predicted', 'Unknown')
+            st.metric("Pattern", pattern)
+        
+        with col3:
+            # Pattern probabilities pie chart
+            probs = latest.get('pattern_probabilities', {})
+            if probs:
+                fig = go.Figure(data=[go.Pie(
+                    labels=[k.replace('_', ' ').title() for k in probs.keys()],
+                    values=list(probs.values()),
+                    hole=.3
+                )])
+                fig.update_layout(
+                    title="Pattern Probabilities",
+                    height=250,
+                    margin=dict(t=50, b=0, l=0, r=0)
                 )
+                st.plotly_chart(fig, use_container_width=True)
+    
+    def render_signal_history(self, ticker, limit=50):
+        """Render signal history chart for a ticker."""
+        signals = self._load_live_signals(ticker)
+        
+        if not signals:
+            st.info(f"No signal history for {ticker}")
+            return
+        
+        # Limit signals
+        signals = signals[-limit:]
+        
+        # Convert to dataframe
+        df = pd.DataFrame(signals)
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        df['confidence_pct'] = df['confidence'] * 100
+        
+        # Create figure with secondary y-axis
+        fig = go.Figure()
+        
+        # Add price trace
+        fig.add_trace(go.Scatter(
+            x=df['timestamp'],
+            y=df['current_price'],
+            name='Price',
+            line=dict(color='blue', width=2),
+            yaxis='y'
+        ))
+        
+        # Add confidence trace
+        fig.add_trace(go.Scatter(
+            x=df['timestamp'],
+            y=df['confidence_pct'],
+            name='Confidence %',
+            line=dict(color='green', width=2, dash='dash'),
+            yaxis='y2'
+        ))
+        
+        # Add signal markers
+        buy_signals = df[df['signal'] == 'BUY']
+        sell_signals = df[df['signal'] == 'SELL']
+        
+        if not buy_signals.empty:
+            fig.add_trace(go.Scatter(
+                x=buy_signals['timestamp'],
+                y=buy_signals['current_price'],
+                mode='markers',
+                name='Buy Signal',
+                marker=dict(color='green', size=10, symbol='triangle-up'),
+                yaxis='y'
+            ))
+        
+        if not sell_signals.empty:
+            fig.add_trace(go.Scatter(
+                x=sell_signals['timestamp'],
+                y=sell_signals['current_price'],
+                mode='markers',
+                name='Sell Signal',
+                marker=dict(color='red', size=10, symbol='triangle-down'),
+                yaxis='y'
+            ))
+        
+        # Update layout with dual y-axes
+        fig.update_layout(
+            title=f"{ticker} - Price and Confidence History",
+            xaxis=dict(title="Time"),
+            yaxis=dict(
+                title=dict(text="Price ($)", font=dict(color="blue")),
+                tickfont=dict(color="blue")
+            ),
+            yaxis2=dict(
+                title=dict(text="Confidence (%)", font=dict(color="green")),
+                tickfont=dict(color="green"),
+                anchor="x",
+                overlaying="y",
+                side="right"
+            ),
+            hovermode='x unified',
+            height=400
+        )
+        
+        st.plotly_chart(fig, use_container_width=True)
+    
+    def render_pattern_distribution(self, ticker):
+        """Render pattern distribution for recent signals."""
+        signals = self._load_live_signals(ticker)
+        
+        if not signals:
+            return
+        
+        # Get recent signals (last 50)
+        recent_signals = signals[-50:]
+        
+        # Count patterns
+        pattern_counts = {}
+        for signal in recent_signals:
+            pattern = signal.get('pattern_predicted', 'Unknown')
+            pattern_counts[pattern] = pattern_counts.get(pattern, 0) + 1
+        
+        if pattern_counts:
+            # Create bar chart
+            fig = go.Figure(data=[
+                go.Bar(
+                    x=list(pattern_counts.keys()),
+                    y=list(pattern_counts.values()),
+                    marker_color=['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728'][:len(pattern_counts)]
+                )
+            ])
             
-            with col2:
-                if status:
-                    last_update = status.get('last_update', 'Unknown')
-                    if isinstance(last_update, str):
-                        try:
-                            last_update = pd.to_datetime(last_update).strftime('%H:%M:%S')
-                        except:
-                            pass
-                    st.metric("Last Update", last_update)
-                else:
-                    st.metric("Last Update", "No Data")
+            fig.update_layout(
+                title=f"{ticker} - Pattern Distribution (Last 50 Signals)",
+                xaxis_title="Pattern",
+                yaxis_title="Count",
+                height=300
+            )
             
-            with col3:
-                if status:
-                    prediction_count = status.get('prediction_count', 0)
-                    error_count = status.get('error_count', 0)
-                    error_rate = error_count / max(prediction_count, 1) * 100
-                    st.metric("Error Rate", f"{error_rate:.1f}%")
-                else:
-                    st.metric("Error Rate", "N/A")
+            st.plotly_chart(fig, use_container_width=True)
+    
+    def render_signal_table(self, ticker, limit=10):
+        """Render table of recent signals."""
+        signals = self._load_live_signals(ticker)
+        
+        if not signals:
+            return
+        
+        # Get recent signals
+        recent = signals[-limit:]
+        recent.reverse()  # Most recent first
+        
+        # Create dataframe
+        df = pd.DataFrame(recent)
+        
+        # Select and format columns
+        display_df = pd.DataFrame({
+            'Time': pd.to_datetime(df['timestamp']).dt.strftime('%Y-%m-%d %H:%M:%S'),
+            'Signal': df['signal'],
+            'Pattern': df['pattern_predicted'],
+            'Confidence': (df['confidence'] * 100).apply(lambda x: f"{x:.2f}%"),
+            'Price': df['current_price'].apply(lambda x: f"${x:.2f}")
+        })
+        
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
+    
+    def render_overall_stats(self, selected_tickers):
+        """Render overall statistics across all tickers."""
+        st.subheader("📊 Overall Statistics")
+        
+        total_predictions = 0
+        total_errors = 0
+        total_buy = 0
+        total_sell = 0
+        
+        for ticker in selected_tickers:
+            status = self._load_live_status(ticker)
+            signals = self._load_live_signals(ticker)
             
-            with col4:
-                if not signals_df.empty:
-                    latest_signal = signals_df.iloc[-1]
-                    signal_color = "🟢" if latest_signal['signal'] == 'BUY' else "🔴" if latest_signal['signal'] == 'SELL' else "🟡"
-                    st.metric("Latest Signal", f"{signal_color} {latest_signal['signal']}")
-                else:
-                    st.metric("Latest Signal", "No Signals")
+            if status:
+                total_predictions += status.get('prediction_count', 0)
+                total_errors += status.get('error_count', 0)
             
-            # Main chart
-            st.subheader("Price Chart & Trading Signals")
-            chart = self.create_candlestick_chart(historical_data, signals_df)
-            st.plotly_chart(chart, use_container_width=True)
+            if signals:
+                for signal in signals:
+                    if signal.get('signal') == 'BUY':
+                        total_buy += 1
+                    elif signal.get('signal') == 'SELL':
+                        total_sell += 1
+        
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.metric("Total Predictions", total_predictions)
+        
+        with col2:
+            st.metric("Total Errors", total_errors)
+        
+        with col3:
+            st.metric("Buy Signals", total_buy)
+        
+        with col4:
+            st.metric("Sell Signals", total_sell)
+    
+    def run(self):
+        """Main application loop."""
+        self.render_header()
+        
+        # Sidebar controls
+        selected_tickers, auto_refresh, refresh_interval = self.render_sidebar()
+        
+        if not selected_tickers:
+            st.info("👈 Please select tickers from the sidebar to view their signals")
+            st.markdown("""
+            ### 🚀 Getting Started
             
-            # Two columns for additional info
+            1. Enter a ticker symbol in the sidebar (e.g., AAPL, GOOGL, TSLA)
+            2. Select a model from the dropdown
+            3. Click "Start Live Prediction" to begin monitoring
+            4. Once started, the ticker will appear in the Active Tickers list
+            5. Select it to view real-time signals and charts
+            
+            ### 📈 Available Features
+            
+            - **Real-time Signals**: View live BUY/SELL signals with confidence scores
+            - **Pattern Recognition**: See which chart patterns are detected
+            - **Price History**: Track price movements and signal timing
+            - **Pattern Distribution**: Analyze pattern frequency
+            - **Auto-refresh**: Keep dashboard updated automatically
+            """)
+            return
+        
+        # Overall stats
+        self.render_overall_stats(selected_tickers)
+        st.markdown("---")
+        
+        # Render each ticker
+        for ticker in selected_tickers:
+            st.header(f"📊 {ticker}")
+            
+            # Status
+            self.render_ticker_status(ticker)
+            
+            # Latest signal
+            st.subheader("Latest Signal")
+            self.render_latest_signal(ticker)
+            
+            # Charts in columns
             col1, col2 = st.columns(2)
             
             with col1:
-                st.subheader("Recent Trading Signals")
-                signals_table = self.create_signals_table(signals_df.tail(10))
-                if not signals_table.empty:
-                    st.dataframe(signals_table, use_container_width=True)
-                else:
-                    st.info("No trading signals available")
+                self.render_signal_history(ticker)
             
             with col2:
-                st.subheader("System Status")
-                if status:
-                    status_data = {
-                        'Metric': ['Model Name', 'Prediction Count', 'Buffer Size', 'Last Prediction'],
-                        'Value': [
-                            str(status.get('model_name', 'N/A')),
-                            str(status.get('prediction_count', 0)),
-                            str(status.get('buffer_size', 0)),
-                            str(status.get('last_prediction_time', 'N/A'))
-                        ]
-                    }
-                    st.dataframe(pd.DataFrame(status_data), use_container_width=True)
-                else:
-                    st.info("No system status available")
+                self.render_pattern_distribution(ticker)
             
-            # Performance metrics
-            if not signals_df.empty:
-                st.subheader("Signal Performance")
-                
-                # Signal distribution
-                signal_counts = signals_df['signal'].value_counts()
-                fig_pie = px.pie(
-                    values=signal_counts.values,
-                    names=signal_counts.index,
-                    title="Signal Distribution",
-                    color_discrete_map={
-                        'BUY': 'green',
-                        'SELL': 'red',
-                        'HOLD': 'yellow'
-                    }
-                )
-                st.plotly_chart(fig_pie, use_container_width=True)
-                
-                # Confidence distribution
-                fig_hist = px.histogram(
-                    signals_df,
-                    x='confidence',
-                    nbins=20,
-                    title="Signal Confidence Distribution",
-                    labels={'confidence': 'Confidence Level', 'count': 'Frequency'}
-                )
-                st.plotly_chart(fig_hist, use_container_width=True)
+            # Signal table
+            with st.expander("📋 Recent Signals"):
+                self.render_signal_table(ticker, limit=20)
+            
+            st.markdown("---")
         
-        else:
-            st.error("Failed to load historical data. Please check your configuration.")
-        
-        # Auto-refresh functionality
+        # Auto refresh
         if auto_refresh:
             time.sleep(refresh_interval)
             st.rerun()
 
 
-def main():
-    """Main function to run the dashboard."""
-    dashboard = Dashboard()
-    dashboard.run()
-
-
+# Main entry point
 if __name__ == "__main__":
-    main()
+    app = DashboardApp()
+    app.run()

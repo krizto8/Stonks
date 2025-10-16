@@ -376,15 +376,88 @@ class DatasetBuilder:
         
         return np.array(normalized_sequences)
     
-    def balance_dataset(self, X, y, tickers, target_count=None):
+    def create_synthetic_sample(self, X, pattern_indices, augmentation_type='smote'):
         """
-        Balance dataset by upsampling rare classes instead of downsampling all.
+        Create a synthetic sample using SMOTE-like technique.
+        
+        Args:
+            X (np.ndarray): All feature sequences
+            pattern_indices (np.ndarray): Indices of samples from same class
+            augmentation_type (str): Type of augmentation ('smote', 'noise', 'scale', 'interpolate')
+        
+        Returns:
+            np.ndarray: Synthetic sample
+        """
+        if augmentation_type == 'smote':
+            # SMOTE: Interpolate between two samples
+            if len(pattern_indices) < 2:
+                # If only one sample, add noise
+                idx = pattern_indices[0]
+                synthetic = X[idx].copy()
+                noise = np.random.normal(0, 0.02, synthetic.shape)
+                return synthetic + noise
+            
+            # Pick two random samples from same class
+            idx1, idx2 = np.random.choice(pattern_indices, size=2, replace=False)
+            
+            # Interpolate with random weight
+            alpha = np.random.uniform(0.3, 0.7)
+            synthetic = alpha * X[idx1] + (1 - alpha) * X[idx2]
+            
+            # Add small noise for extra variation
+            noise = np.random.normal(0, 0.01, synthetic.shape)
+            synthetic = synthetic + noise
+            
+        elif augmentation_type == 'noise':
+            # Add Gaussian noise to existing sample
+            idx = np.random.choice(pattern_indices)
+            synthetic = X[idx].copy()
+            noise = np.random.normal(0, 0.02, synthetic.shape)
+            synthetic = synthetic + noise
+            
+        elif augmentation_type == 'scale':
+            # Scale features slightly
+            idx = np.random.choice(pattern_indices)
+            synthetic = X[idx].copy()
+            
+            # Scale prices (columns 0-3: open, high, low, close)
+            price_scale = np.random.uniform(0.98, 1.02)
+            synthetic[:, :4] *= price_scale
+            
+            # Scale volume (column 4) more aggressively
+            volume_scale = np.random.uniform(0.7, 1.3)
+            if synthetic.shape[1] > 4:
+                synthetic[:, 4] *= volume_scale
+            
+        elif augmentation_type == 'interpolate':
+            # Time-aware interpolation
+            idx = np.random.choice(pattern_indices)
+            synthetic = X[idx].copy()
+            
+            # Add slight trend drift
+            drift = np.random.uniform(-0.01, 0.01)
+            trend = np.linspace(0, drift, len(synthetic))
+            synthetic[:, :4] *= (1 + trend[:, np.newaxis])  # Apply to OHLC
+            
+        else:
+            # Default: simple copy with noise
+            idx = np.random.choice(pattern_indices)
+            synthetic = X[idx].copy()
+            noise = np.random.normal(0, 0.01, synthetic.shape)
+            synthetic = synthetic + noise
+        
+        return synthetic
+    
+    def balance_dataset(self, X, y, tickers, target_count=None, use_smote=True):
+        """
+        Balance dataset using SMOTE-like augmentation instead of naive duplication.
         
         Args:
             X (np.ndarray): Feature sequences
             y (np.ndarray): Pattern labels
             tickers (list): Stock tickers corresponding to each sequence
-            target_count (int): Target count per class (default: max class count)
+            target_count (int): Target count per class (default: median * 1.2)
+            use_smote (bool): Use SMOTE augmentation vs naive duplication
         
         Returns:
             np.ndarray, np.ndarray, list
@@ -394,32 +467,94 @@ class DatasetBuilder:
         label_counts = Counter(y)
         self.logger.info(f"📊 Pattern distribution before balancing: {label_counts}")
         
-        # If no target_count specified, match the largest class
+        # Calculate imbalance ratio
+        max_count = max(label_counts.values())
+        min_count = min(label_counts.values())
+        imbalance_ratio = max_count / min_count if min_count > 0 else float('inf')
+        self.logger.info(f"⚖️  Imbalance ratio: {imbalance_ratio:.2f}:1")
+        
+        # Use median-based target to avoid over-representing majority class
         if target_count is None:
-            target_count = max(label_counts.values())
-        self.logger.info(f"🎯 Balancing to {target_count} samples per class (upsampling rare patterns)")
+            counts = list(label_counts.values())
+            if use_smote:
+                # Use median * 1.2 for SMOTE to avoid too much synthetic data
+                target_count = int(np.median(counts) * 1.2)
+            else:
+                # Use max for naive duplication (old behavior)
+                target_count = max(counts)
+        
+        self.logger.info(f"🎯 Balancing to {target_count} samples per class")
+        if use_smote:
+            self.logger.info(f"🔬 Using SMOTE-like augmentation (creates synthetic variations)")
+        else:
+            self.logger.info(f"📋 Using naive duplication (creates exact copies)")
         
         balanced_X, balanced_y, balanced_tickers = [], [], []
         
         for pattern_id in range(len(self.pattern_labeler.pattern_classes)):
             pattern_indices = np.where(y == pattern_id)[0]
+            pattern_name = self.pattern_labeler.pattern_classes[pattern_id]
+            current_count = len(pattern_indices)
             
-            if len(pattern_indices) == 0:
-                self.logger.warning(f"⚠️ No samples found for pattern {pattern_id}")
+            if current_count == 0:
+                self.logger.warning(f"⚠️ No samples found for pattern {pattern_id} ({pattern_name})")
                 continue
             
-            if len(pattern_indices) < target_count:
-                # Upsample with replacement
-                selected_indices = np.random.choice(pattern_indices, target_count, replace=True)
-            else:
-                # Downsample to target_count if oversampled
-                selected_indices = np.random.choice(pattern_indices, target_count, replace=False)
+            # Add all original samples
+            balanced_X.extend(X[pattern_indices])
+            balanced_y.extend(y[pattern_indices])
+            balanced_tickers.extend([tickers[i] for i in pattern_indices])
             
-            balanced_X.extend(X[selected_indices])
-            balanced_y.extend(y[selected_indices])
-            balanced_tickers.extend([tickers[i] for i in selected_indices])
+            # Augment if needed
+            if current_count < target_count:
+                samples_needed = target_count - current_count
+                self.logger.info(f"   {pattern_name}: {current_count} → {target_count} (adding {samples_needed} synthetic samples)")
+                
+                if use_smote:
+                    # Create synthetic samples using different augmentation techniques
+                    augmentation_types = ['smote', 'noise', 'scale', 'interpolate']
+                    
+                    for i in range(samples_needed):
+                        # Rotate through augmentation types for diversity
+                        aug_type = augmentation_types[i % len(augmentation_types)]
+                        synthetic = self.create_synthetic_sample(X, pattern_indices, aug_type)
+                        
+                        balanced_X.append(synthetic)
+                        balanced_y.append(pattern_id)
+                        # Use original ticker + synthetic marker
+                        original_ticker = tickers[pattern_indices[i % len(pattern_indices)]]
+                        balanced_tickers.append(f"{original_ticker}_syn{i}")
+                else:
+                    # Old behavior: naive duplication
+                    for i in range(samples_needed):
+                        idx = pattern_indices[i % len(pattern_indices)]
+                        balanced_X.append(X[idx])
+                        balanced_y.append(pattern_id)
+                        balanced_tickers.append(tickers[idx])
+            
+            elif current_count > target_count:
+                # Downsample if too many
+                samples_to_remove = current_count - target_count
+                self.logger.info(f"   {pattern_name}: {current_count} → {target_count} (removing {samples_to_remove} samples)")
+                # Already added all samples, need to remove some
+                # Remove the last samples_to_remove that were just added
+                balanced_X = balanced_X[:-samples_to_remove]
+                balanced_y = balanced_y[:-samples_to_remove]
+                balanced_tickers = balanced_tickers[:-samples_to_remove]
         
-        return np.array(balanced_X), np.array(balanced_y), balanced_tickers
+        balanced_X = np.array(balanced_X)
+        balanced_y = np.array(balanced_y)
+        
+        # Report final distribution
+        final_counts = Counter(balanced_y)
+        self.logger.info(f"✅ Final distribution: {final_counts}")
+        
+        # Calculate duplicate statistics
+        unique_samples = len(np.unique(balanced_X.reshape(len(balanced_X), -1), axis=0))
+        duplicate_ratio = (len(balanced_X) - unique_samples) / len(balanced_X) * 100
+        self.logger.info(f"📊 Unique samples: {unique_samples}/{len(balanced_X)} (duplicate ratio: {duplicate_ratio:.1f}%)")
+        
+        return balanced_X, balanced_y, balanced_tickers
 
     
     def split_dataset(self, X, y, tickers):

@@ -16,19 +16,155 @@ import json
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.config import Config
 
+
+def focal_loss(gamma=2.0, alpha=0.25):
+    """
+    Sparse Focal Loss for multi-class classification.
+    
+    Focal loss focuses training on hard examples and down-weights easy ones.
+    This is particularly useful for imbalanced datasets where the model
+    might be biased towards the majority class.
+    
+    This version works with sparse labels (integers) rather than one-hot encoded labels.
+    
+    Args:
+        gamma: Focusing parameter (higher = focus more on hard examples)
+               Recommended: 2.0
+        alpha: Balancing parameter for class weights
+               Recommended: 0.25
+    
+    Returns:
+        Loss function compatible with Keras/TensorFlow
+    
+    Reference:
+        Lin et al. "Focal Loss for Dense Object Detection" (2017)
+    """
+    def sparse_focal_loss_fixed(y_true, y_pred):
+        """
+        Compute sparse focal loss.
+        
+        Args:
+            y_true: Ground truth labels (sparse - integers)
+            y_pred: Predicted probabilities from softmax
+        """
+        # Convert sparse labels to dense (integer type)
+        y_true = tf.cast(tf.reshape(y_true, [-1]), tf.int32)
+        
+        # Get batch size and number of classes
+        batch_size = tf.shape(y_pred)[0]
+        num_classes = tf.shape(y_pred)[1]
+        
+        # Create one-hot encoded labels
+        y_true_one_hot = tf.one_hot(y_true, depth=num_classes)
+        
+        # Avoid division by zero
+        epsilon = keras.backend.epsilon()
+        y_pred = keras.backend.clip(y_pred, epsilon, 1.0 - epsilon)
+        
+        # Get the predicted probability for the true class
+        p_t = tf.reduce_sum(y_true_one_hot * y_pred, axis=-1)
+        
+        # Calculate focal loss
+        # (1 - p_t)^gamma focuses on hard examples
+        focal_weight = tf.pow(1.0 - p_t, gamma)
+        
+        # Calculate cross entropy for true class
+        cross_entropy = -tf.math.log(p_t)
+        
+        # Combine focal weight with cross entropy
+        loss = alpha * focal_weight * cross_entropy
+        
+        return loss
+    
+    return sparse_focal_loss_fixed
+
+
+class PerClassMetricsCallback(keras.callbacks.Callback):
+    """
+    Custom callback to monitor per-class metrics during training.
+    
+    This helps identify which classes/patterns are underperforming
+    and need more attention (e.g., higher class weights, more data).
+    """
+    
+    def __init__(self, validation_data, class_names, log_frequency=5):
+        """
+        Initialize callback.
+        
+        Args:
+            validation_data: Tuple of (X_val, y_val)
+            class_names: List of class names for display
+            log_frequency: Log metrics every N epochs
+        """
+        super().__init__()
+        self.validation_data = validation_data
+        self.class_names = class_names
+        self.log_frequency = log_frequency
+    
+    def on_epoch_end(self, epoch, logs=None):
+        """Called at the end of each epoch."""
+        # Only log every N epochs to avoid clutter
+        if (epoch + 1) % self.log_frequency != 0:
+            return
+        
+        X_val, y_val = self.validation_data
+        
+        # Make predictions
+        predictions = self.model.predict(X_val, verbose=0)
+        y_pred = np.argmax(predictions, axis=1)
+        
+        # Calculate per-class metrics
+        from sklearn.metrics import precision_recall_fscore_support, confusion_matrix
+        
+        precision, recall, f1, support = precision_recall_fscore_support(
+            y_val, y_pred, average=None, zero_division=0
+        )
+        
+        # Print formatted metrics
+        print(f"\n{'='*80}")
+        print(f"📊 Per-Class Metrics (Epoch {epoch + 1})")
+        print(f"{'='*80}")
+        print(f"{'Class':<25} {'Precision':<12} {'Recall':<12} {'F1-Score':<12} {'Support':<10}")
+        print(f"{'-'*80}")
+        
+        for i, class_name in enumerate(self.class_names):
+            if i < len(precision):
+                print(f"{class_name:<25} {precision[i]:>10.3f}  {recall[i]:>10.3f}  "
+                      f"{f1[i]:>10.3f}  {support[i]:>8d}")
+        
+        # Overall accuracy
+        accuracy = np.mean(y_pred == y_val)
+        print(f"{'-'*80}")
+        print(f"{'Overall Accuracy':<25} {accuracy:>10.3f}")
+        print(f"{'='*80}\n")
+        
+        # Identify problematic classes
+        avg_f1 = np.mean(f1)
+        weak_classes = [self.class_names[i] for i, score in enumerate(f1) 
+                       if score < avg_f1 * 0.8 and i < len(f1)]
+        
+        if weak_classes:
+            print(f"⚠️  Classes below 80% of average F1: {', '.join(weak_classes)}")
+            print(f"   → Consider: Higher class weights, more training data, or data augmentation\n")
+
+
 class LSTMModel:
     """
     LSTM model for stock price prediction and trading signal generation.
     """
     
-    def __init__(self, prediction_type: str = "regression"):
+    def __init__(self, prediction_type: str = "regression", use_focal_loss: bool = False, n_classes: int = None):
         """
         Initialize LSTM model.
         
         Args:
             prediction_type: "regression" for price prediction, "classification" for signals
+            use_focal_loss: Use focal loss instead of categorical crossentropy (for classification)
+            n_classes: Number of classes for classification (auto-detected if None)
         """
         self.prediction_type = prediction_type
+        self.use_focal_loss = use_focal_loss
+        self.n_classes = n_classes  # Will be set during training if None
         self.model = None
         self.scaler_X = MinMaxScaler()
         self.scaler_y = MinMaxScaler()
@@ -91,10 +227,28 @@ class LSTMModel:
             
             # Output layer
             if self.prediction_type == "classification":
-                model.add(layers.Dense(3, activation='softmax'))  # Buy, Sell, Hold
+                # Determine number of classes
+                if self.n_classes is None:
+                    # Default to Config if available, otherwise 4 for pattern recognition
+                    if hasattr(Config, 'PATTERN_CLASSES'):
+                        self.n_classes = len(Config.PATTERN_CLASSES)
+                    else:
+                        self.n_classes = 3  # Default: Buy, Sell, Hold
+                
+                self.logger.info(f"Building classification model with {self.n_classes} output classes")
+                model.add(layers.Dense(self.n_classes, activation='softmax'))
+                
+                # Choose loss function
+                if self.use_focal_loss:
+                    loss_fn = focal_loss(gamma=2.0, alpha=0.25)
+                    self.logger.info("Using Focal Loss for classification")
+                else:
+                    loss_fn = 'sparse_categorical_crossentropy'
+                    self.logger.info("Using Sparse Categorical Crossentropy")
+                
                 model.compile(
                     optimizer=keras.optimizers.Adam(learning_rate=Config.LEARNING_RATE),
-                    loss='sparse_categorical_crossentropy',
+                    loss=loss_fn,
                     metrics=['accuracy']
                 )
             else:
@@ -189,9 +343,10 @@ class LSTMModel:
     def train(self, X: np.ndarray, y: np.ndarray, 
              validation_data: Optional[Tuple[np.ndarray, np.ndarray]] = None,
              epochs: int = None, batch_size: int = None, 
-             validation_split: float = None) -> Dict[str, Any]:
+             validation_split: float = None,
+             use_class_weights: bool = True) -> Dict[str, Any]:
         """
-        Train the LSTM model.
+        Train the LSTM model with optional class weighting.
         
         Args:
             X: Training features
@@ -200,6 +355,7 @@ class LSTMModel:
             epochs: Number of training epochs (default: Config.EPOCHS)
             batch_size: Batch size for training (default: Config.BATCH_SIZE)
             validation_split: Validation split ratio (default: Config.VALIDATION_SPLIT)
+            use_class_weights: Automatically compute and use class weights (default: True)
             
         Returns:
             Training history
@@ -212,6 +368,28 @@ class LSTMModel:
             
             # Store feature columns for later use
             self.feature_columns = list(range(X.shape[2]))
+            
+            # *** Auto-detect number of classes if not set ***
+            if self.prediction_type == "classification" and self.n_classes is None:
+                self.n_classes = len(np.unique(y_scaled))
+                self.logger.info(f"🔍 Auto-detected {self.n_classes} classes in training data")
+            
+            # *** NEW: Compute class weights for classification ***
+            class_weight_dict = None
+            if self.prediction_type == "classification" and use_class_weights:
+                from sklearn.utils.class_weight import compute_class_weight
+                
+                # Get unique classes and compute weights
+                classes = np.unique(y_scaled)
+                class_weights = compute_class_weight(
+                    class_weight='balanced',
+                    classes=classes,
+                    y=y_scaled
+                )
+                class_weight_dict = dict(enumerate(class_weights))
+                
+                self.logger.info(f"📊 Computed class weights: {class_weight_dict}")
+                self.logger.info("   Higher weights = minority classes get more attention during training")
             
             # Build model if not already built
             if self.model is None:
@@ -238,12 +416,30 @@ class LSTMModel:
                 )
             ]
             
+            # Add per-class metrics callback for classification with validation data
+            if self.prediction_type == "classification" and validation_data is not None:
+                # Get class names from Config if available
+                if hasattr(Config, 'PATTERN_CLASSES'):
+                    class_names = [Config.PATTERN_CLASSES.get(i, f'Class {i}') 
+                                 for i in range(len(Config.PATTERN_CLASSES))]
+                else:
+                    # Default class names
+                    class_names = [f'Class {i}' for i in range(3)]
+                
+                per_class_callback = PerClassMetricsCallback(
+                    validation_data=validation_data,
+                    class_names=class_names,
+                    log_frequency=5  # Log every 5 epochs
+                )
+                callbacks.append(per_class_callback)
+                self.logger.info("✅ Added per-class metrics monitoring")
+            
             # Use provided parameters or fall back to config defaults
             epochs = epochs or Config.EPOCHS
             batch_size = batch_size or Config.BATCH_SIZE
             validation_split = validation_split or Config.VALIDATION_SPLIT
             
-            # Train model
+            # Train model WITH class weights
             self.history = self.model.fit(
                 X_scaled, y_scaled,
                 batch_size=batch_size,
@@ -251,6 +447,7 @@ class LSTMModel:
                 validation_data=validation_data,
                 validation_split=validation_split if validation_data is None else 0,
                 callbacks=callbacks,
+                class_weight=class_weight_dict,  # *** ADD CLASS WEIGHTS ***
                 verbose=1
             )
             
@@ -390,25 +587,40 @@ class LSTMModel:
             # Load model with custom objects for compatibility
             model_path = os.path.join(Config.MODELS_DIR, f"{model_name}.h5")
             
-            # Try loading with different compatibility modes
+            # Custom objects for loading models with focal loss or other custom functions
+            custom_objects = {
+                'focal_loss': focal_loss
+            }
+            
+            # Try loading with compile=False first to avoid loss function issues
             try:
-                self.model = keras.models.load_model(model_path)
-            except (TypeError, ValueError) as e:
-                if "batch_shape" in str(e):
-                    # Handle batch_shape compatibility issue
-                    self.logger.warning("Attempting to load model with compatibility mode...")
-                    import tensorflow as tf
-                    custom_objects = {}
-                    with tf.keras.utils.custom_object_scope(custom_objects):
-                        self.model = keras.models.load_model(model_path, compile=False)
-                        # Recompile the model
-                        self.model.compile(
-                            optimizer='adam',
-                            loss='sparse_categorical_crossentropy' if self.prediction_type == 'classification' else 'mse',
-                            metrics=['accuracy'] if self.prediction_type == 'classification' else ['mae']
-                        )
+                self.logger.info("Attempting to load model with compile=False...")
+                self.model = keras.models.load_model(model_path, custom_objects=custom_objects, compile=False)
+                
+                # Load metadata first to determine prediction type
+                metadata_path = os.path.join(Config.MODELS_DIR, f"{model_name}_metadata.json")
+                if os.path.exists(metadata_path):
+                    with open(metadata_path, 'r') as f:
+                        metadata = json.load(f)
+                    self.prediction_type = metadata.get('prediction_type', 'classification')
+                    self.feature_columns = metadata.get('feature_columns', [])
                 else:
-                    raise e
+                    self.prediction_type = 'classification'
+                    self.feature_columns = []
+                
+                # Recompile the model with appropriate loss
+                self.logger.info(f"Recompiling model for {self.prediction_type}...")
+                self.model.compile(
+                    optimizer='adam',
+                    loss='sparse_categorical_crossentropy' if self.prediction_type == 'classification' else 'mse',
+                    metrics=['accuracy'] if self.prediction_type == 'classification' else ['mae']
+                )
+                self.logger.info("Model recompiled successfully")
+                
+            except Exception as e:
+                self.logger.error(f"Failed to load with compile=False: {e}")
+                # Try standard loading as fallback
+                self.model = keras.models.load_model(model_path, custom_objects=custom_objects)
             
             # Load scalers
             scaler_X_path = os.path.join(Config.MODELS_DIR, f"{model_name}_scaler_X.pkl")
@@ -424,15 +636,8 @@ class LSTMModel:
                 self.logger.info("No Y scaler found - assuming classification model")
                 self.scaler_y = None
             
-            # Load metadata (optional)
-            metadata_path = os.path.join(Config.MODELS_DIR, f"{model_name}_metadata.json")
-            if os.path.exists(metadata_path):
-                with open(metadata_path, 'r') as f:
-                    metadata = json.load(f)
-                
-                self.prediction_type = metadata.get('prediction_type', 'classification')
-                self.feature_columns = metadata.get('feature_columns', [])
-            else:
+            # Metadata already loaded above if it exists
+            if not hasattr(self, 'prediction_type') or not self.prediction_type:
                 self.logger.info("No metadata found - using default settings for classification model")
                 # Default to classification if no Y scaler and no metadata
                 if self.scaler_y is None:

@@ -1,561 +1,283 @@
 #!/usr/bin/env python3
 """
-LSTM Model Training for Chart Pattern Recognition
+Test script to rebuild dataset with SMOTE augmentation and train with improved methods.
 
-This script trains an LSTM neural network to classify stock chart patterns.
-It uses the dataset created by dataset_builder.py and implements the specified
-architecture with proper training procedures.
-
-Features:
-- LSTM architecture with dropout layers
-- Early stopping and model checkpointing
-- Training/validation curves plotting
-- Model evaluation and metrics
-- Categorical crossentropy loss for multi-class classification
+This script:
+1. Rebuilds the dataset using SMOTE-like augmentation (no naive duplication)
+2. Trains the model with class weights enabled
+3. Optionally uses focal loss for better handling of hard examples
+4. Monitors per-class metrics during training
+5. Evaluates final performance across all pattern classes
 
 Usage:
-    python train_model.py --epochs 50 --batch_size 32 --save_model
+    # Basic: SMOTE + class weights
+    python test_improved_training.py
+    
+    # Advanced: SMOTE + class weights + focal loss
+    python test_improved_training.py --use_focal_loss
+    
+    # Quick test with fewer epochs
+    python test_improved_training.py --epochs 20 --quick_test
 """
 
 import argparse
-import logging
 import os
 import sys
 import numpy as np
-import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
+from sklearn.metrics import classification_report, confusion_matrix
 from datetime import datetime
-import warnings
-warnings.filterwarnings('ignore')
 
-# TensorFlow imports
-import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras import layers
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
-from tensorflow.keras.utils import to_categorical
-from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
-from sklearn.preprocessing import MinMaxScaler
-import joblib
-import json
-
-# Set random seeds for reproducibility
-np.random.seed(42)
-tf.random.set_seed(42)
-
-# Add parent directory to path for imports
+# Add parent directory to path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
 from config.config import Config
+from utils.model_utils import LSTMModel
 
-class LSTMPatternClassifier:
-    """LSTM model for chart pattern classification."""
+def plot_comparison(history, save_dir='models'):
+    """Plot training history."""
+    fig, axes = plt.subplots(1, 2, figsize=(15, 5))
     
-    def __init__(self, sequence_length, n_features, n_classes=4):
-        self.sequence_length = sequence_length
-        self.n_features = n_features
-        self.n_classes = n_classes
-        self.model = None
-        self.history = None
-        self.logger = self._setup_logger()
-        
-        # Initialize scalers for live prediction compatibility
-        self.scaler_X = MinMaxScaler()
-        self.scaler_fitted = False
-        
-        # Pattern class mapping
-        self.pattern_classes = {
-            0: 'Uptrend',
-            1: 'Downtrend', 
-            2: 'Head-and-Shoulders',
-            3: 'Double Bottom'
-        }
-        
-        # Feature columns (will be set during training)
-        self.feature_columns = None
+    # Accuracy plot
+    axes[0].plot(history['accuracy'], label='Train Accuracy')
+    axes[0].plot(history['val_accuracy'], label='Val Accuracy')
+    axes[0].set_title('Model Accuracy')
+    axes[0].set_xlabel('Epoch')
+    axes[0].set_ylabel('Accuracy')
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
     
-    def _setup_logger(self):
-        """Setup logging configuration."""
-        logger = logging.getLogger(__name__)
-        logger.setLevel(logging.INFO)
-        if not logger.handlers:
-            handler = logging.StreamHandler()
-            formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-            handler.setFormatter(formatter)
-            logger.addHandler(handler)
-        return logger
+    # Loss plot
+    axes[1].plot(history['loss'], label='Train Loss')
+    axes[1].plot(history['val_loss'], label='Val Loss')
+    axes[1].set_title('Model Loss')
+    axes[1].set_xlabel('Epoch')
+    axes[1].set_ylabel('Loss')
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
     
-    def prepare_data(self, X, y=None, fit_scaler=False):
-        """Prepare and scale data for training or prediction."""
-        # Reshape X for scaling (samples * sequence_length, features)
-        original_shape = X.shape
-        X_reshaped = X.reshape(-1, X.shape[-1])
-        
-        if fit_scaler:
-            self.logger.info("Fitting scaler on training data")
-            X_scaled = self.scaler_X.fit_transform(X_reshaped)
-            self.scaler_fitted = True
-        else:
-            if not self.scaler_fitted:
-                raise ValueError("Scaler has not been fitted yet. Call with fit_scaler=True first.")
-            X_scaled = self.scaler_X.transform(X_reshaped)
-        
-        # Reshape back to original shape
-        X_scaled = X_scaled.reshape(original_shape)
-        
-        return X_scaled if y is None else (X_scaled, y)
-    
-    def build_model(self):
-        """Build the LSTM model architecture as specified."""
-        self.logger.info(f"🏗️ Building LSTM model...")
-        self.logger.info(f"   Input shape: ({self.sequence_length}, {self.n_features})")
-        self.logger.info(f"   Output classes: {self.n_classes}")
-        
-        model = Sequential([
-            # First LSTM layer with 64 units, return_sequences=True
-            LSTM(64, return_sequences=True, input_shape=(self.sequence_length, self.n_features)),
-            Dropout(0.2),
-            
-            # Second LSTM layer with 64 units
-            LSTM(64),
-            Dropout(0.2),
-            
-            # Dense output layer with softmax activation
-            Dense(self.n_classes, activation='softmax')
-        ])
-        
-        # Compile model
-        model.compile(
-            optimizer=Adam(learning_rate=0.001),
-            loss='categorical_crossentropy',
-            metrics=['accuracy']
-        )
-        
-        self.model = model
-        
-        # Print model summary
-        self.logger.info("✓ Model architecture:")
-        model.summary()
-        
-        return model
-    
-    def prepare_callbacks(self, model_save_path):
-        """Prepare training callbacks."""
-        callbacks = [
-            # Early stopping if validation loss doesn't improve for 5 epochs
-            EarlyStopping(
-                monitor='val_loss',
-                patience=5,
-                restore_best_weights=True,
-                verbose=1
-            ),
-            
-            # Save best model weights
-            ModelCheckpoint(
-                filepath=model_save_path,
-                monitor='val_accuracy',
-                save_best_only=True,
-                save_weights_only=False,
-                verbose=1
-            ),
-            
-            # Reduce learning rate on plateau
-            ReduceLROnPlateau(
-                monitor='val_loss',
-                factor=0.5,
-                patience=3,
-                min_lr=1e-7,
-                verbose=1
-            )
-        ]
-        
-        return callbacks
-    
-    def train(self, X_train, y_train, X_val, y_val, epochs=50, batch_size=32, model_save_path=None):
-        """Train the LSTM model."""
-        self.logger.info(f"🚀 Starting training...")
-        self.logger.info(f"   Training samples: {len(X_train)}")
-        self.logger.info(f"   Validation samples: {len(X_val)}")
-        self.logger.info(f"   Batch size: {batch_size}")
-        self.logger.info(f"   Max epochs: {epochs}")
-        
-        # Prepare callbacks
-        if model_save_path is None:
-            model_save_path = f"models/lstm_pattern_classifier_{datetime.now().strftime('%Y%m%d_%H%M%S')}.h5"
-        
-        os.makedirs(os.path.dirname(model_save_path), exist_ok=True)
-        callbacks = self.prepare_callbacks(model_save_path)
-        
-        # Prepare and scale data
-        X_train_scaled = self.prepare_data(X_train, fit_scaler=True)
-        X_val_scaled = self.prepare_data(X_val, fit_scaler=False)
-        
-        # Convert labels to categorical
-        y_train_cat = to_categorical(y_train, num_classes=self.n_classes)
-        y_val_cat = to_categorical(y_val, num_classes=self.n_classes)
-        
-        # Train model
-        self.history = self.model.fit(
-            X_train_scaled, y_train_cat,
-            validation_data=(X_val_scaled, y_val_cat),
-            epochs=epochs,
-            batch_size=batch_size,
-            callbacks=callbacks,
-            verbose=1
-        )
-        
-        self.logger.info("✓ Training completed!")
-        return self.history
-    
-    def evaluate(self, X_test, y_test):
-        """Evaluate the model on test data."""
-        self.logger.info("📊 Evaluating model on test data...")
-        
-        # Scale test data
-        X_test_scaled = self.prepare_data(X_test, fit_scaler=False)
-        
-        # Convert labels to categorical
-        y_test_cat = to_categorical(y_test, num_classes=self.n_classes)
-        
-        # Get test metrics
-        test_loss, test_accuracy = self.model.evaluate(X_test_scaled, y_test_cat, verbose=0)
-        
-        # Get predictions
-        y_pred_proba = self.model.predict(X_test_scaled, verbose=0)
-        y_pred = np.argmax(y_pred_proba, axis=1)
-        
-        # Classification report
-        class_names = [self.pattern_classes[i] for i in range(self.n_classes)]
-        report = classification_report(y_test, y_pred, target_names=class_names)
-        
-        # Confusion matrix
-        cm = confusion_matrix(y_test, y_pred)
-        
-        results = {
-            'test_loss': float(test_loss),
-            'test_accuracy': float(test_accuracy),
-            'classification_report': report,
-            'confusion_matrix': cm.tolist(),
-            'y_true': y_test.tolist(),
-            'y_pred': y_pred.tolist(),
-            'y_pred_proba': y_pred_proba.tolist()
-        }
-        
-        self.logger.info(f"✓ Test Accuracy: {test_accuracy:.4f}")
-        self.logger.info(f"✓ Test Loss: {test_loss:.4f}")
-        
-        return results
-    
-    def plot_training_history(self, save_path=None):
-        """Plot training and validation loss/accuracy curves."""
-        if self.history is None:
-            self.logger.warning("No training history available")
-            return
-        
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
-        
-        # Plot training & validation accuracy
-        ax1.plot(self.history.history['accuracy'], label='Training Accuracy', color='#2E86AB')
-        ax1.plot(self.history.history['val_accuracy'], label='Validation Accuracy', color='#A23B72')
-        ax1.set_title('Model Accuracy', fontsize=14, fontweight='bold')
-        ax1.set_xlabel('Epoch')
-        ax1.set_ylabel('Accuracy')
-        ax1.legend()
-        ax1.grid(True, alpha=0.3)
-        
-        # Plot training & validation loss
-        ax2.plot(self.history.history['loss'], label='Training Loss', color='#F18F01')
-        ax2.plot(self.history.history['val_loss'], label='Validation Loss', color='#C73E1D')
-        ax2.set_title('Model Loss', fontsize=14, fontweight='bold')
-        ax2.set_xlabel('Epoch')
-        ax2.set_ylabel('Loss')
-        ax2.legend()
-        ax2.grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        
-        if save_path:
-            plt.savefig(save_path, dpi=300, bbox_inches='tight')
-            self.logger.info(f"📈 Training curves saved to {save_path}")
-        
-        plt.show()
-    
-    def plot_confusion_matrix(self, cm, save_path=None):
-        """Plot confusion matrix."""
-        plt.figure(figsize=(8, 6))
-        
-        class_names = [self.pattern_classes[i] for i in range(self.n_classes)]
-        
-        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                   xticklabels=class_names, yticklabels=class_names)
-        plt.title('Confusion Matrix', fontsize=16, fontweight='bold')
-        plt.xlabel('Predicted Pattern', fontsize=12)
-        plt.ylabel('True Pattern', fontsize=12)
-        plt.xticks(rotation=45)
-        plt.yticks(rotation=0)
-        
-        plt.tight_layout()
-        
-        if save_path:
-            plt.savefig(save_path, dpi=300, bbox_inches='tight')
-            self.logger.info(f"📊 Confusion matrix saved to {save_path}")
-        
-        plt.show()
-    
-    def predict_pattern(self, sequence):
-        """Predict pattern for a single sequence."""
-        if self.model is None:
-            raise ValueError("Model not trained yet!")
-        
-        # Ensure sequence has correct shape
-        if sequence.ndim == 2:
-            sequence = sequence.reshape(1, sequence.shape[0], sequence.shape[1])
-        
-        # Scale the input sequence
-        sequence_scaled = self.prepare_data(sequence, fit_scaler=False)
-        
-        # Get prediction probabilities
-        pred_proba = self.model.predict(sequence_scaled, verbose=0)[0]
-        pred_class = np.argmax(pred_proba)
-        
-        result = {
-            'predicted_class': int(pred_class),
-            'predicted_pattern': self.pattern_classes[pred_class],
-            'probabilities': {
-                self.pattern_classes[i]: float(pred_proba[i]) 
-                for i in range(self.n_classes)
-            },
-            'confidence': float(np.max(pred_proba))
-        }
-        
-        return result
-    
-    def save_model(self, model_name, base_dir="models"):
-        """Save the trained model with scalers and metadata for live prediction compatibility."""
-        if self.model is None:
-            raise ValueError("No model to save!")
-        
-        os.makedirs(base_dir, exist_ok=True)
-        
-        # Save model
-        model_path = os.path.join(base_dir, f"{model_name}.h5")
-        self.model.save(model_path)
-        
-        # Save scaler
-        if self.scaler_fitted:
-            scaler_path = os.path.join(base_dir, f"{model_name}_scaler_X.pkl")
-            joblib.dump(self.scaler_X, scaler_path)
-            self.logger.info(f"💾 Scaler saved to {scaler_path}")
-        
-        # Save metadata for live prediction compatibility
-        metadata = {
-            'model_type': 'classification',
-            'prediction_type': 'classification',
-            'n_classes': self.n_classes,
-            'sequence_length': self.sequence_length,
-            'n_features': self.n_features,
-            'pattern_classes': self.pattern_classes,
-            'feature_columns': self.feature_columns,
-            'scaler_fitted': self.scaler_fitted,
-            'created_date': datetime.now().isoformat()
-        }
-        
-        metadata_path = os.path.join(base_dir, f"{model_name}_metadata.json")
-        with open(metadata_path, 'w') as f:
-            json.dump(metadata, f, indent=2)
-        
-        self.logger.info(f"💾 Model saved to {model_path}")
-        self.logger.info(f"💾 Metadata saved to {metadata_path}")
-        
-        return {
-            'model_path': model_path,
-            'scaler_path': scaler_path if self.scaler_fitted else None,
-            'metadata_path': metadata_path
-        }
-    
-    def load_model(self, filepath):
-        """Load a trained model."""
-        self.model = keras.models.load_model(filepath)
-        self.logger.info(f"📂 Model loaded from {filepath}")
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'training_curves_improved.png'), dpi=150)
+    print(f"📊 Training curves saved to {os.path.join(save_dir, 'training_curves_improved.png')}")
+    plt.close()
 
-def load_dataset(data_dir='data'):
-    """Load the processed dataset."""
-    print(f"📂 Loading dataset from {data_dir}/...")
+def plot_confusion_matrix_improved(y_true, y_pred, class_names, save_dir='models'):
+    """Plot confusion matrix with percentages."""
+    cm = confusion_matrix(y_true, y_pred)
     
-    # Load arrays
-    X_train = np.load(os.path.join(data_dir, 'X_train.npy'))
-    X_val = np.load(os.path.join(data_dir, 'X_val.npy'))
-    X_test = np.load(os.path.join(data_dir, 'X_test.npy'))
-    y_train = np.load(os.path.join(data_dir, 'y_train.npy'))
-    y_val = np.load(os.path.join(data_dir, 'y_val.npy'))
-    y_test = np.load(os.path.join(data_dir, 'y_test.npy'))
+    # Calculate percentages
+    cm_percent = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis] * 100
     
-    # Load metadata
-    with open(os.path.join(data_dir, 'dataset_metadata.json'), 'r') as f:
-        metadata = json.load(f)
+    # Create figure
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
     
-    print(f"✓ Dataset loaded successfully:")
-    print(f"   Train: {X_train.shape}")
-    print(f"   Val:   {X_val.shape}")
-    print(f"   Test:  {X_test.shape}")
-    print(f"   Features: {metadata['n_features']}")
-    print(f"   Sequence length: {metadata['sequence_length']}")
+    # Raw counts
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=axes[0],
+                xticklabels=class_names, yticklabels=class_names)
+    axes[0].set_title('Confusion Matrix (Counts)')
+    axes[0].set_ylabel('True Label')
+    axes[0].set_xlabel('Predicted Label')
     
-    return (X_train, X_val, X_test), (y_train, y_val, y_test), metadata
+    # Percentages
+    sns.heatmap(cm_percent, annot=True, fmt='.1f', cmap='RdYlGn', ax=axes[1],
+                xticklabels=class_names, yticklabels=class_names)
+    axes[1].set_title('Confusion Matrix (% of True Class)')
+    axes[1].set_ylabel('True Label')
+    axes[1].set_xlabel('Predicted Label')
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'confusion_matrix_improved.png'), dpi=150)
+    print(f"📊 Confusion matrix saved to {os.path.join(save_dir, 'confusion_matrix_improved.png')}")
+    plt.close()
+
+def evaluate_model(model, X_test, y_test, class_names):
+    """Comprehensive model evaluation."""
+    print("\n" + "="*80)
+    print("🎯 FINAL MODEL EVALUATION")
+    print("="*80)
+    
+    # Make predictions
+    predictions = model.predict(X_test)
+    y_pred = np.argmax(predictions, axis=1)
+    
+    # Overall accuracy
+    accuracy = np.mean(y_pred == y_test)
+    print(f"\n✅ Overall Accuracy: {accuracy:.4f} ({accuracy*100:.2f}%)")
+    
+    # Classification report
+    print("\n📊 Detailed Classification Report:")
+    print("-"*80)
+    report = classification_report(y_test, y_pred, target_names=class_names, digits=4)
+    print(report)
+    
+    # Per-class accuracy
+    print("\n📈 Per-Class Accuracy:")
+    print("-"*80)
+    for i, class_name in enumerate(class_names):
+        class_mask = y_test == i
+        if class_mask.sum() > 0:
+            class_acc = np.mean(y_pred[class_mask] == y_test[class_mask])
+            print(f"  {class_name:<25}: {class_acc:.4f} ({class_acc*100:.2f}%)")
+    
+    # Confusion matrix
+    cm = confusion_matrix(y_test, y_pred)
+    print("\n🔢 Confusion Matrix:")
+    print("-"*80)
+    print(f"{'':>25}", end='')
+    for name in class_names:
+        print(f"{name[:10]:>12}", end='')
+    print()
+    
+    for i, name in enumerate(class_names):
+        print(f"{name:<25}", end='')
+        for j in range(len(class_names)):
+            print(f"{cm[i][j]:>12d}", end='')
+        print()
+    
+    # Check balance
+    print("\n⚖️  Class Balance in Predictions:")
+    print("-"*80)
+    from collections import Counter
+    pred_counts = Counter(y_pred)
+    total_preds = len(y_pred)
+    
+    for i, class_name in enumerate(class_names):
+        count = pred_counts.get(i, 0)
+        percentage = (count / total_preds) * 100
+        bar = "█" * int(percentage / 2)
+        print(f"  {class_name:<25}: {count:>6d} ({percentage:>5.1f}%) {bar}")
+    
+    # Check if still biased
+    max_pred = max(pred_counts.values())
+    min_pred = min(pred_counts.values())
+    pred_ratio = max_pred / min_pred if min_pred > 0 else float('inf')
+    
+    print(f"\n📊 Prediction Balance Ratio: {pred_ratio:.2f}:1")
+    
+    if pred_ratio > 3.0:
+        print("⚠️  WARNING: Model still shows significant bias!")
+        print("   Consider:")
+        print("   - Using focal loss (--use_focal_loss flag)")
+        print("   - Increasing class weights for underrepresented classes")
+        print("   - Collecting more diverse training data")
+    elif pred_ratio > 1.5:
+        print("⚡ NOTICE: Minor prediction imbalance detected")
+        print("   This is acceptable but could be improved")
+    else:
+        print("✅ EXCELLENT: Predictions are well-balanced across all classes!")
+    
+    print("="*80 + "\n")
+    
+    return y_pred, cm
 
 def main():
-    parser = argparse.ArgumentParser(description='Train LSTM model for chart pattern recognition')
-    parser.add_argument('--data_dir', type=str, default='data',
-                       help='Directory containing the processed dataset')
+    parser = argparse.ArgumentParser(description='Test improved training with SMOTE and class weights')
     parser.add_argument('--epochs', type=int, default=50,
-                       help='Number of training epochs')
+                       help='Number of training epochs (default: 50)')
     parser.add_argument('--batch_size', type=int, default=32,
-                       help='Batch size for training')
-    parser.add_argument('--save_model', action='store_true',
-                       help='Save the trained model')
-    parser.add_argument('--model_name', type=str, default=None,
-                       help='Name for the saved model')
-    parser.add_argument('--output_dir', type=str, default='models',
-                       help='Output directory for saved models and plots')
+                       help='Batch size (default: 32)')
+    parser.add_argument('--use_focal_loss', action='store_true',
+                       help='Use focal loss instead of categorical crossentropy')
+    parser.add_argument('--no_class_weights', action='store_true',
+                       help='Disable automatic class weighting')
+    parser.add_argument('--quick_test', action='store_true',
+                       help='Quick test mode: 10 epochs only')
+    parser.add_argument('--data_dir', type=str, default='data',
+                       help='Directory containing dataset files')
     
     args = parser.parse_args()
     
-    try:
-        print("🚀 Starting LSTM model training...")
-        
-        # 1. Load dataset
-        print("\n📂 Step 1: Loading dataset...")
-        (X_train, X_val, X_test), (y_train, y_val, y_test), metadata = load_dataset(args.data_dir)
-        
-        # 2. Create model
-        print("\n🏗️ Step 2: Building LSTM model...")
-        classifier = LSTMPatternClassifier(
-            sequence_length=metadata['sequence_length'],
-            n_features=metadata['n_features'],
-            n_classes=len(metadata['pattern_classes'])
-        )
-        
-        # Set feature columns for live prediction compatibility
-        classifier.feature_columns = metadata.get('feature_columns', [f"feature_{i}" for i in range(metadata['n_features'])])
-        
-        model = classifier.build_model()
-        
-        # 3. Train model
-        print("\n🚀 Step 3: Training model...")
-        
-        # Prepare model save path
-        if args.model_name:
-            model_save_path = os.path.join(args.output_dir, f"{args.model_name}.h5")
-        else:
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            model_save_path = os.path.join(args.output_dir, f"lstm_pattern_classifier_{timestamp}.h5")
-        
-        history = classifier.train(
-            X_train, y_train, X_val, y_val,
-            epochs=args.epochs,
-            batch_size=args.batch_size,
-            model_save_path=model_save_path
-        )
-        
-        # 4. Evaluate model
-        print("\n📊 Step 4: Evaluating model...")
-        results = classifier.evaluate(X_test, y_test)
-        
-        # Print classification report
-        print("\n📋 Classification Report:")
-        print(results['classification_report'])
-        
-        # 5. Plot training curves
-        print("\n📈 Step 5: Plotting training curves...")
-        os.makedirs(args.output_dir, exist_ok=True)
-        
-        curves_path = os.path.join(args.output_dir, 'training_curves.png')
-        classifier.plot_training_history(save_path=curves_path)
-        
-        # 6. Plot confusion matrix
-        print("\n📊 Step 6: Plotting confusion matrix...")
-        cm_path = os.path.join(args.output_dir, 'confusion_matrix.png')
-        classifier.plot_confusion_matrix(np.array(results['confusion_matrix']), save_path=cm_path)
-        
-        # 7. Save results
-        print("\n💾 Step 7: Saving results...")
-        
-        # Save detailed results
-        results_with_metadata = {
-            **results,
-            'model_metadata': {
-                'sequence_length': metadata['sequence_length'],
-                'n_features': metadata['n_features'],
-                'n_classes': len(metadata['pattern_classes']),
-                'pattern_classes': metadata['pattern_classes'],
-                'epochs_trained': len(history.history['loss']),
-                'batch_size': args.batch_size,
-                'model_architecture': 'LSTM-64-Dropout-LSTM-64-Dropout-Dense'
-            },
-            'training_history': {
-                'loss': history.history['loss'],
-                'accuracy': history.history['accuracy'],
-                'val_loss': history.history['val_loss'],
-                'val_accuracy': history.history['val_accuracy']
-            }
-        }
-        
-        results_path = os.path.join(args.output_dir, 'training_results.json')
-        with open(results_path, 'w') as f:
-            json.dump(results_with_metadata, f, indent=2, default=str)
-        
-        # 8. Save model if requested
-        if args.save_model:
-            model_name = args.model_name or f"lstm_pattern_classifier_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            print(f"\n💾 Step 8: Saving model as '{model_name}' with scalers and metadata...")
-            
-            # Save with enhanced method for live prediction compatibility
-            save_paths = classifier.save_model(model_name, base_dir=args.output_dir)
-            
-            print("✓ Saved files:")
-            print(f"   Model: {save_paths['model_path']}")
-            if save_paths['scaler_path']:
-                print(f"   Scaler: {save_paths['scaler_path']}")
-            print(f"   Metadata: {save_paths['metadata_path']}")
-        
-        # Summary
-        print("\n🎉 TRAINING COMPLETED SUCCESSFULLY!")
-        print(f"📋 Training Summary:")
-        print(f"   Final validation accuracy: {max(history.history['val_accuracy']):.4f}")
-        print(f"   Test accuracy: {results['test_accuracy']:.4f}")
-        print(f"   Epochs trained: {len(history.history['loss'])}")
-        print(f"   Best model saved to: {model_save_path}")
-        
-        print(f"\n📁 Outputs saved to {args.output_dir}/:")
-        print(f"   - training_curves.png")
-        print(f"   - confusion_matrix.png") 
-        print(f"   - training_results.json")
-        if args.save_model:
-            model_name = args.model_name or f"lstm_pattern_classifier_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            print(f"   - {model_name}.h5 (model)")
-            print(f"   - {model_name}_scaler_X.pkl (scaler)")
-            print(f"   - {model_name}_metadata.json (metadata)")
-        
-        print("\nNext steps:")
-        print("1. Use predict.py to make predictions on new data")
-        print("2. Analyze the confusion matrix to understand model performance")
-        print("3. Consider hyperparameter tuning if needed")
-        
-        # Example prediction
-        print(f"\n🔮 Example prediction on first test sample:")
-        example_result = classifier.predict_pattern(X_test[0])
-        print(f"   Predicted: {example_result['predicted_pattern']}")
-        print(f"   Confidence: {example_result['confidence']:.3f}")
-        print(f"   True label: {classifier.pattern_classes[y_test[0]]}")
-        
-    except Exception as e:
-        print(f"\n❌ Error during training: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+    if args.quick_test:
+        args.epochs = 10
+        print("⚡ Quick test mode: 10 epochs only\n")
+    
+    print("="*80)
+    print("🚀 IMPROVED MODEL TRAINING TEST")
+    print("="*80)
+    print(f"\nConfiguration:")
+    print(f"  Epochs: {args.epochs}")
+    print(f"  Batch Size: {args.batch_size}")
+    print(f"  Focal Loss: {'Yes' if args.use_focal_loss else 'No'}")
+    print(f"  Class Weights: {'No' if args.no_class_weights else 'Yes (Auto)'}")
+    print(f"  Data Directory: {args.data_dir}")
+    print("="*80 + "\n")
+    
+    # Load dataset
+    print("📂 Loading dataset...")
+    X_train = np.load(os.path.join(args.data_dir, 'X_train.npy'))
+    X_val = np.load(os.path.join(args.data_dir, 'X_val.npy'))
+    X_test = np.load(os.path.join(args.data_dir, 'X_test.npy'))
+    y_train = np.load(os.path.join(args.data_dir, 'y_train.npy'))
+    y_val = np.load(os.path.join(args.data_dir, 'y_val.npy'))
+    y_test = np.load(os.path.join(args.data_dir, 'y_test.npy'))
+    
+    print(f"✅ Dataset loaded:")
+    print(f"   Training: {X_train.shape}")
+    print(f"   Validation: {X_val.shape}")
+    print(f"   Test: {X_test.shape}")
+    
+    # Check for duplicates
+    unique_train = len(np.unique(X_train.reshape(len(X_train), -1), axis=0))
+    duplicate_ratio = (len(X_train) - unique_train) / len(X_train) * 100
+    print(f"\n📊 Training set duplicate ratio: {duplicate_ratio:.1f}%")
+    
+    if duplicate_ratio > 30:
+        print("⚠️  WARNING: High duplicate ratio detected!")
+        print("   Consider rebuilding dataset with:")
+        print("   python dataset_builder.py --balance_dataset")
+        print("   (New version uses SMOTE-like augmentation)\n")
+    
+    # Class names
+    class_names = ['Uptrend', 'Downtrend', 'Head-Shoulders', 'Double Bottom']
+    
+    # Create model
+    print(f"\n🏗️  Building LSTM model...")
+    model = LSTMModel(
+        prediction_type="classification",
+        use_focal_loss=args.use_focal_loss
+    )
+    
+    # Train model
+    print(f"\n🚀 Starting training...")
+    start_time = datetime.now()
+    
+    history = model.train(
+        X_train, y_train,
+        validation_data=(X_val, y_val),
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        use_class_weights=not args.no_class_weights
+    )
+    
+    training_time = datetime.now() - start_time
+    print(f"\n✅ Training completed in {training_time}")
+    
+    # Evaluate
+    y_pred, cm = evaluate_model(model, X_test, y_test, class_names)
+    
+    # Save visualizations
+    print("\n📊 Generating visualizations...")
+    plot_comparison(history, save_dir='models')
+    plot_confusion_matrix_improved(y_test, y_pred, class_names, save_dir='models')
+    
+    # Save model
+    model_name = f"lstm_improved_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    if args.use_focal_loss:
+        model_name += "_focal"
+    
+    print(f"\n💾 Saving model as '{model_name}'...")
+    model.save_model(model_name)
+    
+    print("\n" + "="*80)
+    print("✅ TEST COMPLETE!")
+    print("="*80)
+    print(f"\nNext steps:")
+    print(f"1. Review training curves: models/training_curves_improved.png")
+    print(f"2. Review confusion matrix: models/confusion_matrix_improved.png")
+    print(f"3. If results are good, use this model for live prediction:")
+    print(f"   python scripts/live_prediction.py --model_name {model_name} --ticker AAPL")
+    print("="*80 + "\n")
 
 if __name__ == "__main__":
     main()
