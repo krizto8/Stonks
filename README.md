@@ -23,7 +23,7 @@ Navigate to `http://localhost:8503`, enter any ticker (AAPL, GOOGL, etc.), and c
 
 ## 📁 Structure
 
-```
+
 Stonks/
 ├── dashboard/
 │   └── dashboard_app_v2.py      # Main dashboard
